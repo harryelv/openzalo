@@ -26,6 +26,11 @@ function readProbeFailure(value: unknown): { failed: boolean; error?: string } {
   };
 }
 
+function isExpectedLoggedOutMessage(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return lower.includes("logged out") || lower.includes("not logged in");
+}
+
 export function resolveOpenzaloAccountState(params: {
   enabled: boolean;
   configured: boolean;
@@ -62,7 +67,7 @@ export function collectOpenzaloStatusIssues(accounts: ChannelAccountSnapshot[]):
     }
 
     const probeFailure = readProbeFailure(account.probe);
-    if (probeFailure.failed) {
+    if (probeFailure.failed && !isExpectedLoggedOutMessage(probeFailure.error ?? "")) {
       issues.push({
         channel: "openzalo",
         accountId,
@@ -79,20 +84,20 @@ export function collectOpenzaloStatusIssues(accounts: ChannelAccountSnapshot[]):
       account.connected === false ? false : account.connected === true ? true : null;
     const reconnectAttempts = asNumber(account.reconnectAttempts);
     const lastError = asString(account.lastError);
-    if (running && connected === false) {
+    
+    if (running && connected === false && lastError && !isExpectedLoggedOutMessage(lastError)) {
       issues.push({
         channel: "openzalo",
         accountId,
         kind: "runtime",
         message:
-          `openzca disconnected${reconnectAttempts != null ? ` (reconnectAttempts=${reconnectAttempts})` : ""}` +
-          `${lastError ? `: ${lastError}` : "."}`,
+          `openzca disconnected${reconnectAttempts != null ? ` (reconnectAttempts=${reconnectAttempts})` : ""}: ${lastError}`,
         fix: "Check openzca auth/profile health on the gateway host and inspect gateway logs.",
       });
       continue;
     }
 
-    if (lastError) {
+    if (lastError && !isExpectedLoggedOutMessage(lastError)) {
       issues.push({
         channel: "openzalo",
         accountId,

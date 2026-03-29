@@ -1,4 +1,5 @@
 import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "./account-id.js";
+import { listOpenzaloRuntimeAccountIds } from "./runtime-health.js";
 import type { CoreConfig, OpenzaloAccountConfig, ResolvedOpenzaloAccount } from "./types.js";
 
 function listConfiguredAccountIds(cfg: CoreConfig): string[] {
@@ -10,7 +11,7 @@ function listConfiguredAccountIds(cfg: CoreConfig): string[] {
 }
 
 export function listOpenzaloAccountIds(cfg: CoreConfig): string[] {
-  const ids = listConfiguredAccountIds(cfg);
+  const ids = Array.from(new Set([...listConfiguredAccountIds(cfg), ...listOpenzaloRuntimeAccountIds()]));
   if (ids.length === 0) {
     return [DEFAULT_ACCOUNT_ID];
   }

@@ -28,6 +28,8 @@ export function clearOpenzaloRuntimeHealthState(accountId?: string): void {
   reconnectHandlers.delete(normalized);
 }
 
+export function listOpenzaloRuntimeAccountIds(): string[] { return Array.from(runtimeHealthByAccount.keys()); }
+
 export function getOpenzaloRuntimeHealthState(
   accountId: string,
 ): OpenzaloRuntimeHealthState | undefined {

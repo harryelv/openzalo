@@ -56,6 +56,15 @@ function toErrorText(error: unknown): string {
   return typeof error === "string" ? error : String(error);
 }
 
+/** 
+ * Returns true if the error indicates that the profile is simply not logged in.
+ * This is an EXPECTED state, not a system failure.
+ */
+function isExpectedLoggedOutError(error: unknown): boolean {
+  const text = toErrorText(error).toLowerCase();
+  return text.includes("not logged in") || text.includes("logged out");
+}
+
 function computeReconnectDelayMs(attempt: number): number {
   const normalizedAttempt = Math.max(1, Math.floor(attempt));
   const base = Math.min(
@@ -177,11 +186,14 @@ function noteOpenzaloDisconnected(params: {
   });
 }
 
+/** 
+ * Extended return type to handle the expected logged-out state.
+ */
 async function waitForOpenzcaReady(options: {
   account: ResolvedOpenzaloAccount;
   runtime: RuntimeEnv;
   abortSignal: AbortSignal;
-}): Promise<boolean> {
+}): Promise<"ready" | "logged-out" | "aborted"> {
   const { account, runtime, abortSignal } = options;
   const startedAt = Date.now();
   const deadlineAt = startedAt + OPENZALO_READY_TIMEOUT_MS;
@@ -197,11 +209,18 @@ async function waitForOpenzcaReady(options: {
         timeoutMs: 8_000,
         signal: abortSignal,
       });
-      return true;
+      return "ready";
     } catch (error) {
       if (abortSignal.aborted) {
-        return false;
+        return "aborted";
       }
+      
+      // NEW: If we see we aren't logged in, exit the loop immediately.
+      // There is no point in retrying for 30 seconds if we don't have a session.
+      if (isExpectedLoggedOutError(error)) {
+        return "logged-out";
+      }
+      
       lastError = toErrorText(error);
     }
 
@@ -218,12 +237,12 @@ async function waitForOpenzcaReady(options: {
     try {
       await sleepWithAbort(OPENZALO_READY_POLL_MS, abortSignal);
     } catch {
-      return false;
+      return "aborted";
     }
   }
 
   if (abortSignal.aborted) {
-    return false;
+    return "aborted";
   }
   throw new Error(`openzca not ready after ${OPENZALO_READY_TIMEOUT_MS}ms (${lastError})`);
 }
@@ -399,12 +418,20 @@ export async function monitorOpenzaloProvider(options: OpenzaloMonitorOptions): 
     const attemptStartedAt = Date.now();
     let streamEndReason: string | null = null;
     try {
-      const ready = await waitForOpenzcaReady({
+      const readyState = await waitForOpenzcaReady({
         account,
         runtime,
         abortSignal,
       });
-      if (!ready || abortSignal.aborted) {
+      
+      // NEW: If we aren't logged in, SHUT DOWN the watchdog silently.
+      if (readyState === "logged-out") {
+        runtime.log?.(`[${account.accountId}] openzca not logged in; monitor exiting silently.`);
+        statusSink?.({ lastError: null }); // Ensure no error is shown in UI
+        return; // SILENT EXIT
+      }
+      
+      if (readyState !== "ready" || abortSignal.aborted) {
         return;
       }
 
@@ -547,6 +574,14 @@ export async function monitorOpenzaloProvider(options: OpenzaloMonitorOptions): 
         });
         return;
       }
+      
+      // NEW: Catch-all for expected logged out errors in the main loop
+      if (isExpectedLoggedOutError(error)) {
+        runtime.log?.(`[${account.accountId}] auth lost; monitor exiting silently.`);
+        statusSink?.({ lastError: null });
+        return;
+      }
+
       const attemptDurationMs = Date.now() - attemptStartedAt;
       reconnectAttempt = nextReconnectAttempt(reconnectAttempt, attemptDurationMs);
       const delayMs = computeReconnectDelayMs(reconnectAttempt);

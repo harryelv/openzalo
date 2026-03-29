@@ -37,7 +37,7 @@ import { getOpenzaloRuntimeHealthState } from "./runtime-health.js";
 import { sendMediaOpenzalo, sendTextOpenzalo } from "./send.js";
 import { OpenzaloConfigSchema } from "./config-schema.js";
 import { collectOpenzaloStatusIssues, resolveOpenzaloAccountState } from "./status.js";
-import { runOpenzcaCommand, runOpenzcaInteractive } from "./openzca.js";
+import { runOpenzcaCommand, runOpenzcaInteractive, runOpenzcaStreaming } from "./openzca.js";
 import { normalizeResolvedGroupTarget, normalizeResolvedUserTarget } from "./resolver-target.js";
 import type { CoreConfig, OpenzaloProbe, ResolvedOpenzaloAccount } from "./types.js";
 
@@ -113,6 +113,17 @@ function chooseDirectoryMatch<Row extends { id: string; name?: string }>(params:
   return { ambiguous: false };
 }
 
+type LoginSession = {
+  qrDataUrl?: string;
+  connected: boolean;
+  error?: string;
+  resolveQr?: (qr: string) => void;
+  resolveDone?: (result: { connected: boolean }) => void;
+  reject?: (err: Error) => void;
+};
+
+const loginSessions = new Map<string, LoginSession>();
+
 export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount, OpenzaloProbe> = {
   id: "openzalo",
   meta,
@@ -126,6 +137,7 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount, OpenzaloProb
     groupManagement: true,
     blockStreaming: true,
   },
+  gatewayMethods: ["web.login.start", "web.login.wait"],
   pairing: {
     idLabel: "openzaloSenderId",
     normalizeAllowEntry: (entry) => normalizeOpenzaloAllowEntry(entry),
@@ -153,13 +165,6 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount, OpenzaloProb
         enabled,
         allowTopLevel: true,
       }),
-    deleteAccount: ({ cfg, accountId }) =>
-      deleteAccountFromConfigSection({
-        cfg: cfg as CoreConfig,
-        sectionKey: "openzalo",
-        accountId,
-        clearBaseFields: ["name", "profile", "zcaBinary"],
-      }),
     // Keep startup config static so gateway-level restart/backoff can recover
     // from transient auth/CLI failures after updates or restarts.
     isConfigured: (account) => account.configured,
@@ -171,6 +176,13 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount, OpenzaloProb
       profile: account.profile,
       zcaBinary: account.zcaBinary,
     }),
+    deleteAccount: ({ cfg, accountId }) =>
+      deleteAccountFromConfigSection({
+        cfg: cfg as CoreConfig,
+        sectionKey: "openzalo",
+        accountId,
+        clearBaseFields: ["name", "profile", "zcaBinary"],
+      }),
     resolveAllowFrom: ({ cfg, accountId }) =>
       (resolveAccount(cfg, accountId).config.allowFrom ?? []).map((entry) => String(entry)),
     formatAllowFrom: ({ allowFrom }) =>
@@ -629,6 +641,99 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount, OpenzaloProb
       } catch {
         return { cleared: false, loggedOut: false };
       }
+    },
+    loginWithQrStart: async (params) => {
+      const accountId = normalizeAccountId(params.accountId) || DEFAULT_ACCOUNT_ID;
+      const sessionKey = `openzalo:${accountId}`;
+      const existing = loginSessions.get(sessionKey);
+      if (existing) {
+        if (params.force) {
+          loginSessions.delete(sessionKey);
+        } else if (existing.qrDataUrl) {
+          return { qrDataUrl: existing.qrDataUrl };
+        }
+      }
+
+      const session: LoginSession = { connected: false };
+      loginSessions.set(sessionKey, session);
+
+      const qrPromise = new Promise<string>((resolve, reject) => {
+        session.resolveQr = resolve;
+        session.reject = reject;
+      });
+
+      const donePromise = new Promise<{ connected: boolean }>((resolve) => {
+        session.resolveDone = resolve;
+      });
+
+      // Background process: run openzca auth login --qr-base64
+      void (async () => {
+        try {
+          const cfg = getOpenzaloRuntime().config.loadConfig() as CoreConfig;
+          const account = resolveAccount(cfg, accountId);
+          
+          await runOpenzcaStreaming({
+            binary: account.zcaBinary,
+            profile: account.profile,
+            args: ["auth", "login", "--qr-base64"],
+            onStdoutLine: (line) => {
+              const trimmed = line.trim();
+              if (trimmed.startsWith("data:image/png;base64,")) {
+                session.qrDataUrl = trimmed;
+                session.resolveQr?.(trimmed);
+              }
+            },
+          });
+
+          // After QR scan or process exit, wait for credentials to appear
+          const pollStart = Date.now();
+          while (Date.now() - pollStart < 60_000) {
+            const probe = await probeOpenzaloAuth({ account, timeoutMs: 5000 });
+            if (probe.ok) {
+              session.connected = true;
+              session.resolveDone?.({ connected: true });
+              return;
+            }
+            await new Promise((r) => setTimeout(r, 2000));
+          }
+          session.resolveDone?.({ connected: false });
+        } catch (err) {
+          session.error = String(err);
+          session.reject?.(err instanceof Error ? err : new Error(String(err)));
+          session.resolveDone?.({ connected: false });
+        } finally {
+          setTimeout(() => loginSessions.delete(sessionKey), 60_000).unref();
+        }
+      })();
+
+      const qrDataUrl = await qrPromise;
+      return { qrDataUrl };
+    },
+    loginWithQrWait: async (params) => {
+      const accountId = normalizeAccountId(params.accountId) || DEFAULT_ACCOUNT_ID;
+      const sessionKey = `openzalo:${accountId}`;
+      const session = loginSessions.get(sessionKey);
+      if (!session) {
+        throw new Error("Login session not found or expired");
+      }
+      if (session.connected) {
+        return { connected: true };
+      }
+      return await new Promise<{ connected: boolean }>((resolve, reject) => {
+        const originalResolve = session.resolveDone;
+        const originalReject = session.reject;
+        session.resolveDone = (res) => {
+          originalResolve?.(res);
+          resolve(res);
+        };
+        session.reject = (err) => {
+          originalReject?.(err);
+          reject(err);
+        };
+        if (params.timeoutMs) {
+          setTimeout(() => reject(new Error("Login wait timed out")), params.timeoutMs).unref();
+        }
+      });
     },
   },
 };
